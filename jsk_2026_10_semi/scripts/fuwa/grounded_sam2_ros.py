@@ -1,13 +1,14 @@
 
 #!/usr/bin/env python3
 """
-RealSense -> Grounding DINO -> SAM 2 -> ROS 2 image topics
+RealSense -> Grounding DINO (every 10 sec) -> SAM 2 -> ROS 2
 
 Output:
   /grounded_sam2/debug_image
   /grounded_sam2/mask
 """
 
+import queue
 import threading
 import time
 
@@ -29,6 +30,10 @@ from transformers import (
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 
+# ==============================
+# Settings
+# ==============================
+
 IMAGE_TOPIC = "/camera/camera/color/image_raw"
 
 DINO_MODEL = "IDEA-Research/grounding-dino-tiny"
@@ -39,8 +44,10 @@ PROMPT = "a tablecloth. a piece of fabric. a cloth."
 BOX_THRESHOLD = 0.25
 TEXT_THRESHOLD = 0.25
 
-# Reject huge bounding boxes covering most of the image.
 MAX_BOX_AREA_RATIO = 0.60
+
+# Run Grounding DINO once every 10 seconds.
+DINO_INTERVAL = 10.0
 
 
 class GroundedSAM2Node(Node):
@@ -58,7 +65,10 @@ class GroundedSAM2Node(Node):
             f"Using device: {self.device}"
         )
 
-        # Load models only once.
+        # ------------------------------
+        # Load Grounding DINO
+        # ------------------------------
+
         self.get_logger().info("Loading Grounding DINO...")
 
         self.processor = AutoProcessor.from_pretrained(
@@ -72,6 +82,10 @@ class GroundedSAM2Node(Node):
             .eval()
         )
 
+        # ------------------------------
+        # Load SAM 2
+        # ------------------------------
+
         self.get_logger().info("Loading SAM 2...")
 
         self.sam = SAM2ImagePredictor.from_pretrained(
@@ -80,6 +94,18 @@ class GroundedSAM2Node(Node):
         )
 
         self.get_logger().info("Models loaded.")
+
+        # ------------------------------
+        # DINO frequency control
+        # ------------------------------
+
+        self.dino_interval = DINO_INTERVAL
+        self.last_dino_time = 0.0
+        self.cached_candidates = []
+
+        # ------------------------------
+        # ROS publishers
+        # ------------------------------
 
         self.debug_pub = self.create_publisher(
             Image,
@@ -93,11 +119,16 @@ class GroundedSAM2Node(Node):
             10,
         )
 
-        # Latest-frame-only buffer.
-        self.lock = threading.Lock()
-        self.latest_frame = None
-        self.new_frame = threading.Event()
+        # ------------------------------
+        # Frame queue
+        # ------------------------------
+
+        self.frame_queue = queue.Queue()
         self.running = True
+
+        # ------------------------------
+        # ROS subscriber
+        # ------------------------------
 
         self.subscription = self.create_subscription(
             Image,
@@ -106,59 +137,79 @@ class GroundedSAM2Node(Node):
             qos_profile_sensor_data,
         )
 
+        # ------------------------------
+        # Processing thread
+        # ------------------------------
+
         self.worker = threading.Thread(
             target=self.process_loop,
             daemon=True,
         )
+
         self.worker.start()
 
         self.get_logger().info(
             f"Waiting for images on {IMAGE_TOPIC}"
         )
 
+    # ==============================
+    # Receive camera images
+    # ==============================
+
     def image_callback(self, msg):
+
         frame = self.bridge.imgmsg_to_cv2(
             msg,
             desired_encoding="bgr8",
         )
 
-        # Keep newest frame, discard older frames.
-        with self.lock:
-            self.latest_frame = (frame.copy(), msg.header)
+        self.frame_queue.put(
+            (frame.copy(), msg.header)
+        )
 
-        self.new_frame.set()
+    # ==============================
+    # Processing loop
+    # ==============================
 
     def process_loop(self):
+
         while self.running:
-            if not self.new_frame.wait(timeout=0.5):
+
+            try:
+                frame, header = self.frame_queue.get(
+                    timeout=0.5
+                )
+
+            except queue.Empty:
                 continue
-
-            with self.lock:
-                item = self.latest_frame
-                self.latest_frame = None
-                self.new_frame.clear()
-
-            if item is None:
-                continue
-
-            frame, header = item
 
             start = time.perf_counter()
 
             try:
+
                 self.process_frame(frame, header)
 
                 elapsed = time.perf_counter() - start
+
                 self.get_logger().info(
                     f"Processing time: {elapsed:.2f}s"
                 )
 
             except Exception as exc:
+
                 self.get_logger().error(
                     f"Processing error: {exc}"
                 )
 
+            finally:
+                self.frame_queue.task_done()
+
+    # ==============================
+    # Grounding DINO detection
+    # ==============================
+
     def detect(self, frame):
+
         h, w = frame.shape[:2]
 
         rgb = cv2.cvtColor(
@@ -195,12 +246,17 @@ class GroundedSAM2Node(Node):
             result["scores"],
             result["text_labels"],
         ):
+
             box = box.cpu().numpy()
             score = float(score)
 
             x1, y1, x2, y2 = box
 
-            area = max(0, x2 - x1) * max(0, y2 - y1)
+            area = (
+                max(0, x2 - x1)
+                * max(0, y2 - y1)
+            )
+
             area_ratio = area / (w * h)
 
             if area_ratio > MAX_BOX_AREA_RATIO:
@@ -217,56 +273,98 @@ class GroundedSAM2Node(Node):
 
         return candidates
 
+    # ==============================
+    # SAM 2 segmentation
+    # ==============================
+
     def segment(self, frame, box):
+
         rgb = cv2.cvtColor(
             frame,
             cv2.COLOR_BGR2RGB,
         )
 
         with torch.inference_mode():
+
             self.sam.set_image(rgb)
 
             masks, scores, _ = self.sam.predict(
                 box=np.asarray(
-                    box, dtype=np.float32
+                    box,
+                    dtype=np.float32,
                 ),
                 multimask_output=True,
             )
 
         best_index = int(np.argmax(scores))
 
-        return masks[best_index].astype(np.uint8) * 255
+        return (
+            masks[best_index].astype(np.uint8) * 255
+        )
+
+    # ==============================
+    # Process one frame
+    # ==============================
 
     def process_frame(self, frame, header):
 
-        candidates = self.detect(frame)
+        # ------------------------------
+        # Grounding DINO every 10 sec
+        # ------------------------------
+
+        now = time.monotonic()
+
+        if (
+            now - self.last_dino_time
+            >= self.dino_interval
+        ):
+
+            self.get_logger().info(
+                "Running Grounding DINO..."
+            )
+
+            self.cached_candidates = self.detect(frame)
+
+            self.last_dino_time = time.monotonic()
+
+        candidates = self.cached_candidates
+
+        # ------------------------------
+        # Prepare images
+        # ------------------------------
 
         debug = frame.copy()
+
         mask = np.zeros(
             frame.shape[:2],
             dtype=np.uint8,
         )
 
-        if candidates:
-            box, score, label = candidates[0]
+        # ------------------------------
+        # SAM 2 segmentation
+        # ------------------------------
 
-            self.get_logger().info(
-                f"Selected: {label} ({score:.2f})"
-            )
+        if candidates:
+
+            box, score, label = candidates[0]
 
             mask = self.segment(frame, box)
 
-            # Orange overlay on mask.
             overlay = debug.copy()
-            overlay[mask > 0] = (0, 180, 255)
+
+            overlay[mask > 0] = (
+                0, 180, 255
+            )
 
             debug = cv2.addWeighted(
-                overlay, 0.40,
-                debug, 0.60,
+                overlay,
+                0.40,
+                debug,
+                0.60,
                 0,
             )
 
-            # Draw largest external contour.
+            # Draw contour
             contours, _ = cv2.findContours(
                 mask,
                 cv2.RETR_EXTERNAL,
@@ -274,6 +372,7 @@ class GroundedSAM2Node(Node):
             )
 
             if contours:
+
                 largest = max(
                     contours,
                     key=cv2.contourArea,
@@ -287,6 +386,7 @@ class GroundedSAM2Node(Node):
                     2,
                 )
 
+            # Draw bounding box
             x1, y1, x2, y2 = map(int, box)
 
             cv2.rectangle(
@@ -308,7 +408,6 @@ class GroundedSAM2Node(Node):
             )
 
         else:
-            self.get_logger().info("No object detected")
 
             cv2.putText(
                 debug,
@@ -320,33 +419,50 @@ class GroundedSAM2Node(Node):
                 2,
             )
 
-        # Publish annotated image.
+        # ------------------------------
+        # Publish debug image
+        # ------------------------------
+
         debug_msg = self.bridge.cv2_to_imgmsg(
             debug,
             encoding="bgr8",
         )
+
         debug_msg.header = header
+
         self.debug_pub.publish(debug_msg)
 
-        # Publish binary mask.
+        # ------------------------------
+        # Publish segmentation mask
+        # ------------------------------
+
         mask_msg = self.bridge.cv2_to_imgmsg(
             mask,
             encoding="mono8",
         )
+
         mask_msg.header = header
+
         self.mask_pub.publish(mask_msg)
 
+    # ==============================
+    # Shutdown
+    # ==============================
+
     def stop(self):
+
         self.running = False
-        self.new_frame.set()
         self.worker.join()
 
 
 def main():
+
     rclpy.init()
+
     node = None
 
     try:
+
         node = GroundedSAM2Node()
         rclpy.spin(node)
 
@@ -354,6 +470,7 @@ def main():
         pass
 
     finally:
+
         if node is not None:
             node.stop()
             node.destroy_node()
