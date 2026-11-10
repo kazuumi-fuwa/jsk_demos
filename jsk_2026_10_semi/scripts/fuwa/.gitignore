@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+
+# ROS build artifacts
+build/
+install/
+log/
+
+# Recorded data
+*.mcap
+*.db3
+*.bag
+*.bag.active
+
+# Local calibration results
+calibration_local.yaml
+calibration_*.local.yaml
+
+# Temporary files
+*.tmp
+*.bak
+.DS_Store
