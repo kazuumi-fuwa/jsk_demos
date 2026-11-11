@@ -109,7 +109,12 @@ class Corner3D(Node):
             di = self.depth_info
             candidates = list(self.depth_frames)
         if ci is None or di is None or not candidates:
-            self.get_logger().warn('Waiting for CameraInfo/depth', throttle_duration_sec=3)
+            self.get_logger().warn(
+                f"Waiting: color_info={ci is not None}, "
+                f"depth_info={di is not None}, "
+                f"depth_frames={len(candidates)}",
+                throttle_duration_sec=3
+            )
             return
         selected = min(candidates, key=lambda item: abs(item[0] - rgb_ns))
         depth_ns, depth_frame, encoding, depth = selected
